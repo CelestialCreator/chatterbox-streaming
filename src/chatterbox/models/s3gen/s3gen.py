@@ -296,3 +296,211 @@ class S3Token2Wav(S3Token2Mel):
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
 
         return output_wavs, output_sources
+
+    @torch.inference_mode()
+    async def stream_inference(
+        self,
+        speech_token_generator,
+        # locally-computed ref embedding (mutex with ref_dict)
+        ref_wav: Optional[torch.Tensor] = None,
+        ref_sr: Optional[int] = None,
+        # pre-computed ref embedding (prod API)
+        ref_dict: Optional[dict] = None,
+        chunk_size: int = 50,  # Number of tokens per chunk
+        sample_rate: int = 24000,  # Target sample rate (16kHz or 48kHz)
+    ):
+        """
+        Streaming version of inference that processes speech tokens in chunks and yields audio chunks.
+        
+        Args:
+            speech_token_generator: Async generator that yields speech tokens
+            ref_wav: reference waveform for voice cloning
+            ref_sr: reference sample rate
+            ref_dict: pre-computed reference embeddings
+            chunk_size: number of tokens to process in each chunk
+            sample_rate: target sample rate for output audio (16000 or 48000)
+            
+        Yields:
+            torch.Tensor: audio chunks as 1D tensors
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("Starting S3Gen stream_inference")
+        
+        # Get reference embeddings
+        if ref_dict is None:
+            ref_dict = self.embed_ref(ref_wav, ref_sr)
+        else:
+            # type/device casting (all values will be numpy if it's from a prod API call)
+            for rk in list(ref_dict):
+                if isinstance(ref_dict[rk], np.ndarray):
+                    ref_dict[rk] = torch.from_numpy(ref_dict[rk])
+                if torch.is_tensor(ref_dict[rk]):
+                    ref_dict[rk] = ref_dict[rk].to(self.device)
+        
+        # Initialize HiFi-GAN cache
+        hift_cache_source = torch.zeros(1, 1, 0).to(self.device)
+        
+        # Buffer for accumulating tokens
+        token_buffer = []
+        chunk_count = 0
+        
+        # Process tokens as they arrive
+        async for token in speech_token_generator:
+            # Add token to buffer (handle both tensor and scalar values)
+            if torch.is_tensor(token):
+                # Token is already a tensor, extract the scalar value
+                token_buffer.append(token.item() if token.numel() == 1 else token)
+            else:
+                # Token is a scalar value
+                token_buffer.append(token)
+            
+            # When we have enough tokens, process them
+            if len(token_buffer) >= chunk_size:
+                chunk_count += 1
+                logger.info(f"Processing token chunk #{chunk_count} with {len(token_buffer)} tokens")
+                try:
+                    # Convert buffer to tensor - properly handle 1D tensor creation
+                    # Handle both scalar values and tensor values in the buffer
+                    processed_tokens = []
+                    for t in token_buffer:
+                        if torch.is_tensor(t):
+                            if t.numel() == 1:
+                                processed_tokens.append(t.item())
+                            else:
+                                processed_tokens.append(t)
+                        else:
+                            processed_tokens.append(t)
+                    
+                    # If all tokens are scalars, create tensor directly
+                    if all(not torch.is_tensor(t) for t in processed_tokens):
+                        speech_tokens = torch.tensor(processed_tokens, dtype=torch.long, device=self.device).unsqueeze(0)  # (1, chunk_size)
+                    else:
+                        # If some tokens are tensors, stack them properly
+                        speech_tokens = torch.stack([
+                            t if torch.is_tensor(t) else torch.tensor(t, device=self.device, dtype=torch.long) 
+                            for t in processed_tokens
+                        ]).unsqueeze(0).to(dtype=torch.long, device=self.device)
+                    
+                    logger.info(f"Speech tokens shape: {speech_tokens.shape}")
+                    
+                    # Process through flow model with error handling
+                    try:
+                        output_mels = self.flow_inference(
+                            speech_tokens, 
+                            ref_wav=ref_wav, 
+                            ref_sr=ref_sr, 
+                            ref_dict=ref_dict, 
+                            finalize=False
+                        )
+                        logger.info(f"Output mels shape: {output_mels.shape}")
+                    except Exception as e:
+                        logger.error(f"Flow inference error: {e}")
+                        # Clear buffer and continue
+                        token_buffer = []
+                        continue
+                    
+                    # Process through HiFi-GAN
+                    try:
+                        output_wavs, hift_cache_source = self.hift_inference(output_mels, hift_cache_source)
+                        logger.info(f"Output wavs shape: {output_wavs.shape}")
+                    except Exception as e:
+                        logger.error(f"HiFi-GAN inference error: {e}")
+                        # Clear buffer and continue
+                        token_buffer = []
+                        continue
+                    
+                    # Resample if needed
+                    if sample_rate != S3GEN_SR:
+                        resampler = get_resampler(S3GEN_SR, sample_rate, self.device)
+                        output_wavs = resampler(output_wavs)
+                    
+                    # Yield the audio chunk - ensure correct shape with proper error handling
+                    try:
+                        if output_wavs.dim() == 3:
+                            audio_chunk = output_wavs.squeeze(0).squeeze(0)  # (chunk_length,)
+                        elif output_wavs.dim() == 2:
+                            audio_chunk = output_wavs.squeeze(0)  # (chunk_length,)
+                        else:
+                            audio_chunk = output_wavs  # Already 1D
+                        
+                        logger.info(f"Yielding audio chunk #{chunk_count} with shape {audio_chunk.shape}")
+                        yield audio_chunk
+                    except Exception as e:
+                        logger.error(f"Error yielding audio chunk: {e}")
+                        # Continue processing
+                        pass
+                    
+                except Exception as e:
+                    logger.error(f"Error processing token chunk: {e}")
+                    # Continue with next chunk
+                
+                # Clear buffer
+                token_buffer = []
+        
+        # Process any remaining tokens
+        if token_buffer:
+            try:
+                # Convert buffer to tensor - properly handle 1D tensor creation
+                # Handle both scalar values and tensor values in the buffer
+                processed_tokens = []
+                for t in token_buffer:
+                    if torch.is_tensor(t):
+                        if t.numel() == 1:
+                            processed_tokens.append(t.item())
+                        else:
+                            processed_tokens.append(t)
+                    else:
+                        processed_tokens.append(t)
+                
+                # If all tokens are scalars, create tensor directly
+                if all(not torch.is_tensor(t) for t in processed_tokens):
+                    speech_tokens = torch.tensor(processed_tokens, dtype=torch.long, device=self.device).unsqueeze(0)  # (1, remaining_tokens)
+                else:
+                    # If some tokens are tensors, stack them properly
+                    speech_tokens = torch.stack([
+                        t if torch.is_tensor(t) else torch.tensor(t, device=self.device, dtype=torch.long) 
+                        for t in processed_tokens
+                    ]).unsqueeze(0).to(dtype=torch.long, device=self.device)
+                
+                # Process through flow model with finalize=True
+                try:
+                    output_mels = self.flow_inference(
+                        speech_tokens, 
+                        ref_wav=ref_wav, 
+                        ref_sr=ref_sr, 
+                        ref_dict=ref_dict, 
+                        finalize=True
+                    )
+                except Exception as e:
+                    logger.error(f"Final flow inference error: {e}")
+                    return
+                
+                # Process through HiFi-GAN
+                try:
+                    output_wavs, _ = self.hift_inference(output_mels, hift_cache_source)
+                except Exception as e:
+                    logger.error(f"Final HiFi-GAN inference error: {e}")
+                    return
+                
+                # Resample if needed
+                if sample_rate != S3GEN_SR:
+                    resampler = get_resampler(S3GEN_SR, sample_rate, self.device)
+                    output_wavs = resampler(output_wavs)
+                
+                # Apply trim fade only to the beginning if this is the first chunk
+                # For streaming, we apply it only once at the very beginning
+                # TODO: Implement proper overlap handling for streaming
+                
+                # Yield the final audio chunk - ensure correct shape
+                try:
+                    if output_wavs.dim() == 3:
+                        yield output_wavs.squeeze(0).squeeze(0)  # (chunk_length,)
+                    elif output_wavs.dim() == 2:
+                        yield output_wavs.squeeze(0)  # (chunk_length,)
+                    else:
+                        yield output_wavs  # Already 1D
+                except Exception as e:
+                    logger.error(f"Error yielding final audio chunk: {e}")
+            except Exception as e:
+                logger.error(f"Error processing final token chunk: {e}")
