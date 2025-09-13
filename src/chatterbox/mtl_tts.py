@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import logging
 
 import librosa
 import torch
@@ -126,6 +127,8 @@ class Conditionals:
 
     @classmethod
     def load(cls, fpath, map_location="cpu"):
+        if isinstance(map_location, str):
+            map_location = torch.device(map_location)
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
@@ -161,9 +164,17 @@ class ChatterboxMultilingualTTS:
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
 
+        # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
+        if device in ["cpu", "mps"]:
+            map_location = torch.device('cpu')
+            weights_only = False  # For CPU devices, we need to set weights_only=False to avoid deserialization issues
+        else:
+            map_location = None
+            weights_only = True
+
         ve = VoiceEncoder()
         ve.load_state_dict(
-            torch.load(ckpt_dir / "ve.pt", weights_only=True)
+            torch.load(ckpt_dir / "ve.pt", map_location=map_location, weights_only=weights_only)
         )
         ve.to(device).eval()
 
@@ -176,7 +187,7 @@ class ChatterboxMultilingualTTS:
 
         s3gen = S3Gen()
         s3gen.load_state_dict(
-            torch.load(ckpt_dir / "s3gen.pt", weights_only=True)
+            torch.load(ckpt_dir / "s3gen.pt", map_location=map_location, weights_only=weights_only)
         )
         s3gen.to(device).eval()
 
@@ -186,12 +197,20 @@ class ChatterboxMultilingualTTS:
 
         conds = None
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
-            conds = Conditionals.load(builtin_voice).to(device)
+            conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
     def from_pretrained(cls, device: torch.device) -> 'ChatterboxMultilingualTTS':
+        # Check if MPS is available on macOS
+        if device == "mps" and not torch.backends.mps.is_available():
+            if not torch.backends.mps.is_built():
+                print("MPS not available because the current PyTorch install was not built with MPS enabled.")
+            else:
+                print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
+            device = "cpu"
+
         ckpt_dir = Path(
             snapshot_download(
                 repo_id=REPO_ID,
@@ -299,3 +318,97 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    async def stream_generate(
+        self,
+        text,
+        language_id=None,
+        repetition_penalty=2.0,
+        min_p=0.05,
+        top_p=1.0,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        chunk_size=50,  # Number of tokens per chunk
+        sample_rate=24000,  # Target sample rate (16kHz or 48kHz)
+    ):
+        """
+        Streaming version of generate that yields audio chunks as they are produced.
+        
+        Args:
+            text: input text to synthesize
+            language_id: language code for the text (e.g., "en", "es", "fr")
+            repetition_penalty: penalty for repeated tokens
+            min_p: minimum probability sampling parameter
+            top_p: nucleus sampling parameter
+            audio_prompt_path: path to reference audio for voice cloning
+            exaggeration: controls speech expressiveness
+            cfg_weight: classifier-free guidance weight
+            temperature: sampling temperature
+            chunk_size: number of tokens to process in each chunk
+            sample_rate: target sample rate for output audio (16000 or 48000)
+            
+        Yields:
+            torch.Tensor: audio chunks as 1D tensors
+        """
+        # Validate language_id
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+        
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Update exaggeration if needed
+        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        # Create a wrapper async generator for T3 tokens
+        async def token_generator():
+            async for token in self.t3.stream_generate(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=1000,  # TODO: use the value in config
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            ):
+                # Filter invalid tokens
+                if token < 6561:  # SPEECH_VOCAB_SIZE
+                    yield token
+
+        # Stream audio chunks using S3Gen
+        logger = logging.getLogger(__name__)
+        chunk_count = 0
+        async for audio_chunk in self.s3gen.stream_inference(
+            speech_token_generator=token_generator(),
+            ref_dict=self.conds.gen,
+            chunk_size=chunk_size,
+            sample_rate=sample_rate,
+        ):
+            chunk_count += 1
+            logger.info(f"MTL TTS yielding audio chunk #{chunk_count}")
+            yield audio_chunk
